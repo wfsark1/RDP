@@ -109,8 +109,8 @@ jobs:
 
       - name: Install MetaTrader 5
         run: |
-          $mt5Url  = "https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/mt5setup.exe"
-          $mt5Path = "$env:TEMP\mt5setup.exe"
+          $mt5Url  = "https://download.terminal.free/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
+          $mt5Path = "$env:TEMP\exness5setup.exe"
 
           Write-Host "⬇️  Downloading MetaTrader 5..."
           Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Path -UseBasicParsing
