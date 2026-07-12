@@ -1,0 +1,1678 @@
+name: 🪟 Windows RDP with Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: "Pilih Versi Windows (OS)"
+        required: true
+        default: "windows-2025"
+        type: choice
+        options:
+          # Recommended stable Windows x64 runners
+          - "windows-latest"
+          - "windows-2025"
+          - "windows-2022"
+
+          # Windows ARM64 runner
+          - "windows-11-arm"
+
+          # Public repository only / Visual Studio 2026 image
+          # Jika repo private gagal, gunakan windows-2025 atau windows-2022
+          - "windows-2025-vs2026"
+
+      duration_hours:
+        description: "Durasi RDP Aktif (Jam)"
+        required: true
+        default: "6"
+        type: choice
+        options:
+          - "1"
+          - "3"
+          - "6"
+
+      ide_choice:
+        description: "Pilih IDE yang akan diinstall"
+        required: true
+        default: "vscode"
+        type: choice
+        options:
+          - "antigravity"
+          - "vscode"
+          - "both"
+
+      install_capcut:
+        description: "Install CapCut?"
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+
+      tailscale_hostname:
+        description: "Nama dasar hostname Tailscale/RDP"
+        required: true
+        default: "rdp-runner"
+        type: string
+
+      hostname_mode:
+        description: "Mode hostname: sama setiap running atau unik per running"
+        required: true
+        default: "same_each_run"
+        type: choice
+        options:
+          - "unique_each_run"
+          - "same_each_run"
+
+      rdp_password_mode:
+        description: "Mode password RDP: random setiap running atau sama dari secrets.RDP_PASSWORD"
+        required: true
+        default: "same_from_secret"
+        type: choice
+        options:
+          - "random_each_run"
+          - "same_from_secret"
+
+jobs:
+  secure-rdp:
+    name: 🖥️ Windows Remote Desktop
+    runs-on: ${{ inputs.windows_version }}
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: RDP
+
+    steps:
+      - name: ⚡ Optimize Windows Performance
+        shell: pwsh
+        run: |
+          Write-Host "==========================================="
+          Write-Host " Optimizing Windows for RDP Performance"
+          Write-Host "==========================================="
+
+          # Visual & animation tweaks
+          $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+          Set-ItemProperty -Path $regPath -Name "VisualFXSetting" -Value 2 -Force -ErrorAction SilentlyContinue
+
+          $perf = "HKCU:\Control Panel\Desktop"
+          Set-ItemProperty -Path $perf -Name "MenuShowDelay" -Value "0" -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $perf -Name "DragFullWindows" -Value "0" -Force -ErrorAction SilentlyContinue
+
+          # High performance power plan
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg -hibernate off
+
+          # Disable unnecessary services
+          $services = @(
+            "SysMain",
+            "WSearch",
+            "DiagTrack",
+            "dmwappushservice",
+            "MapsBroker",
+            "XblGameSave",
+            "XboxNetApiSvc",
+            "RetailDemo",
+            "TabletInputService"
+          )
+
+          foreach ($svc in $services) {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Enable audio service
+          Set-Service -Name "Audiosrv" -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name "Audiosrv" -ErrorAction SilentlyContinue
+
+          # Optional Defender optimization
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+
+          # Network tweaks
+          netsh int tcp set global autotuninglevel=normal
+          netsh int tcp set global chimney=disabled
+          netsh int tcp set supplemental internet congestionprovider=ctcp
+
+          Write-Host "✅ Windows optimization completed"
+
+      - name: 🔐 Configure RDP
+        shell: pwsh
+        run: |
+          Write-Host "Configuring Remote Desktop..."
+
+          # Enable RDP
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          # Compatibility mode for GitHub Actions RDP
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 0 `
+            -Force
+
+          # 32-bit color depth
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "ColorDepth" `
+            -Value 4 `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          # Firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          Restart-Service -Name TermService -Force
+
+          Write-Host "✅ RDP configured"
+
+      - name: 👤 Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $passwordMode = '${{ inputs.rdp_password_mode }}'
+
+          Write-Host "Preparing RDP password..."
+          Write-Host "Password mode: $passwordMode"
+
+          if ($passwordMode -eq "same_from_secret") {
+            if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD_SECRET)) {
+              Write-Error "❌ rdp_password_mode=same_from_secret dipilih, tapi GitHub Secret RDP_PASSWORD belum diset. Tambahkan di Settings > Secrets and variables > Actions > Repository secrets."
+              exit 1
+            }
+
+            $password = $env:RDP_PASSWORD_SECRET
+            Write-Host "::add-mask::$password"
+            Write-Host "Using fixed password from GitHub Secret: RDP_PASSWORD"
+          } else {
+            # Password generator that works on GitHub Actions Windows runner
+            $upper   = [char[]](65..90)   | Get-Random -Count 4
+            $lower   = [char[]](97..122)  | Get-Random -Count 4
+            $number  = [char[]](48..57)   | Get-Random -Count 4
+            $special = [char[]]@(33,64,35,36,42,43,45,61) | Get-Random -Count 4
+
+            $password = -join ($upper + $lower + $number + $special | Sort-Object { Get-Random })
+          }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Remove old user if exists
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:RDP_USER
+          }
+
+          New-LocalUser `
+            -Name $env:RDP_USER `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -UserMayNotChangePassword
+
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+
+          "RDP_PASSWORD=$password" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "RDP_PASSWORD_MODE=$passwordMode" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          Write-Host "✅ User RDP created"
+          Write-Host "Username: $env:RDP_USER"
+
+          if ($passwordMode -eq "same_from_secret") {
+            Write-Host "Password: using GitHub Secret RDP_PASSWORD"
+          } else {
+            Write-Host "Password: $password"
+          }
+
+      - name: 📦 Install Apps, IDE & Extensions
+        shell: pwsh
+        run: |
+          Write-Host "==========================================="
+          Write-Host " Installing requested apps, IDE and extensions"
+          Write-Host "==========================================="
+
+          $ideChoice = '${{ inputs.ide_choice }}'
+          $installCapCut = '${{ inputs.install_capcut }}'
+          $wantedVSCode = $ideChoice -in @("vscode", "both")
+          $wantedAntigravity = $ideChoice -in @("antigravity", "both")
+
+          Write-Host "IDE choice      : $ideChoice"
+          Write-Host "Install CapCut  : $installCapCut"
+
+          # Resolve winget path on GitHub Actions Windows runners
+          $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+
+          if (-not $winget) {
+            $wingetCandidates = @(
+              "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
+            )
+
+            $wingetCandidates += Get-ChildItem `
+              -Path "$env:ProgramFiles\WindowsApps" `
+              -Filter "winget.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+
+            $winget = $wingetCandidates |
+              Where-Object { $_ -and (Test-Path $_) } |
+              Select-Object -First 1
+          }
+
+          if (-not $winget) {
+            Write-Error "❌ winget.exe tidak ditemukan di runner Windows ini"
+            exit 1
+          }
+
+          Write-Host "Using winget: $winget"
+          & $winget source update --disable-interactivity
+
+          function Install-WingetPackage {
+            param(
+              [Parameter(Mandatory = $true)] [string] $Id,
+              [Parameter(Mandatory = $true)] [string] $Name,
+              [string[]] $FallbackIds = @(),
+              [string] $Scope = "",
+              [switch] $Optional
+            )
+
+            $packageIds = @($Id) + $FallbackIds
+
+            foreach ($packageId in $packageIds) {
+              Write-Host "Installing $Name [$packageId]..."
+
+              $installArgs = @(
+                "install",
+                "--id", $packageId,
+                "--exact",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--disable-interactivity"
+              )
+
+              if (-not [string]::IsNullOrWhiteSpace($Scope)) {
+                $installArgs += @("--scope", $Scope)
+              }
+
+              & $winget @installArgs
+
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "✅ $Name installed with package ID: $packageId"
+                return $true
+              }
+
+              Write-Warning "Install failed for $packageId. Trying fallback if available..."
+            }
+
+            if ($Optional) {
+              Write-Warning "⚠️ Failed to install optional app: $Name"
+              return $false
+            }
+
+            Write-Error "❌ Failed to install $Name"
+            exit 1
+          }
+
+          function Resolve-AppTarget {
+            param(
+              [string[]] $CandidatePaths = @(),
+              [string[]] $SearchRoots = @(),
+              [string[]] $ExecutableNames = @()
+            )
+
+            foreach ($candidate in $CandidatePaths) {
+              if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+              $expanded = [Environment]::ExpandEnvironmentVariables($candidate)
+              if (Test-Path $expanded) {
+                return (Resolve-Path $expanded).Path
+              }
+            }
+
+            foreach ($root in $SearchRoots) {
+              if ([string]::IsNullOrWhiteSpace($root)) { continue }
+
+              $expandedRoot = [Environment]::ExpandEnvironmentVariables($root)
+              if (-not (Test-Path $expandedRoot)) { continue }
+
+              foreach ($exeName in $ExecutableNames) {
+                $found = Get-ChildItem `
+                  -Path $expandedRoot `
+                  -Filter $exeName `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+
+                if ($found) {
+                  return $found.FullName
+                }
+              }
+            }
+
+            return $null
+          }
+
+          function Resolve-VSCodeCli {
+            $candidates = @(
+              "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd",
+              "${env:ProgramFiles(x86)}\Microsoft VS Code\bin\code.cmd",
+              "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd"
+            )
+
+            foreach ($candidate in $candidates) {
+              if ($candidate -and (Test-Path $candidate)) {
+                return (Resolve-Path $candidate).Path
+              }
+            }
+
+            $cmd = (Get-Command code.cmd -ErrorAction SilentlyContinue).Source
+            if ($cmd) { return $cmd }
+
+            return $null
+          }
+
+          function Resolve-AntigravityExecutable {
+            return Resolve-AppTarget `
+              -CandidatePaths @(
+                "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
+                "$env:LOCALAPPDATA\Antigravity IDE\Antigravity IDE.exe",
+                "C:\Users\runneradmin\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe",
+                "$env:ProgramFiles\Antigravity IDE\Antigravity IDE.exe",
+                "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe"
+              ) `
+              -SearchRoots @(
+                "$env:LOCALAPPDATA\Programs",
+                "$env:LOCALAPPDATA",
+                "C:\Users\runneradmin\AppData\Local\Programs",
+                "$env:ProgramFiles",
+                "${env:ProgramFiles(x86)}"
+              ) `
+              -ExecutableNames @("Antigravity IDE.exe", "antigravity-ide.exe")
+          }
+
+          function Install-EditorExtension {
+            param(
+              [Parameter(Mandatory = $true)] [string] $ToolPath,
+              [Parameter(Mandatory = $true)] [string] $ExtensionId,
+              [Parameter(Mandatory = $true)] [string] $ExtensionName
+            )
+
+            if ([string]::IsNullOrWhiteSpace($ToolPath) -or -not (Test-Path $ToolPath)) {
+              Write-Warning "Cannot install $ExtensionName because editor CLI was not found."
+              return $false
+            }
+
+            Write-Host "Installing editor extension: $ExtensionName [$ExtensionId]"
+            & $ToolPath --install-extension $ExtensionId --force
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Extension installed: $ExtensionName"
+              return $true
+            }
+
+            Write-Warning "⚠️ Extension install failed: $ExtensionName [$ExtensionId]"
+            return $false
+          }
+
+          function Register-RdpLogonTask {
+            param(
+              [Parameter(Mandatory = $true)] [string] $TaskName,
+              [Parameter(Mandatory = $true)] [string] $ScriptPath
+            )
+
+            try {
+              $action = New-ScheduledTaskAction `
+                -Execute "powershell.exe" `
+                -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
+              $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:RDP_USER
+
+              try {
+                $trigger.Delay = "PT1M"
+              } catch {
+                Write-Host "Trigger delay is not supported on this runner. Continuing without delay."
+              }
+
+              Register-ScheduledTask `
+                -TaskName $TaskName `
+                -Action $action `
+                -Trigger $trigger `
+                -User $env:RDP_USER `
+                -Password $env:RDP_PASSWORD `
+                -RunLevel Highest `
+                -Force | Out-Null
+
+              Write-Host "✅ Logon task registered for $env:RDP_USER`: $TaskName"
+            } catch {
+              Write-Warning "Could not register logon task '$TaskName': $($_.Exception.Message)"
+            }
+          }
+
+          # Base apps
+          Install-WingetPackage -Id "Google.Chrome" -Name "Google Chrome"
+          Install-WingetPackage -Id "RARLab.WinRAR" -Name "WinRAR"
+          Install-WingetPackage -Id "OpenJS.NodeJS.LTS" -Name "Node.js LTS"
+
+          # IDE choice
+          if ($wantedAntigravity) {
+            Install-WingetPackage -Id "Google.AntigravityIDE" -Name "Antigravity IDE"
+          } else {
+            Write-Host "Skipping Antigravity IDE because ide_choice=$ideChoice"
+          }
+
+          if ($wantedVSCode) {
+            # Force machine-wide install so VS Code opens for the RDP user, not only runneradmin.
+            Install-WingetPackage -Id "Microsoft.VisualStudioCode" -Name "Visual Studio Code" -Scope "machine"
+          } else {
+            Write-Host "Skipping Visual Studio Code because ide_choice=$ideChoice"
+          }
+
+          if ($wantedVSCode) {
+            $vscodeMachineExe = Resolve-AppTarget `
+              -CandidatePaths @(
+                "$env:ProgramFiles\Microsoft VS Code\Code.exe",
+                "${env:ProgramFiles(x86)}\Microsoft VS Code\Code.exe"
+              ) `
+              -SearchRoots @(
+                "$env:ProgramFiles\Microsoft VS Code",
+                "${env:ProgramFiles(x86)}\Microsoft VS Code"
+              ) `
+              -ExecutableNames @("Code.exe")
+
+            if ($vscodeMachineExe) {
+              Write-Host "✅ VS Code machine-wide executable found: $vscodeMachineExe"
+            } else {
+              Write-Warning "VS Code was installed but machine-wide Code.exe was not found. The RDP user may not be able to open VS Code. Check the winget install log."
+            }
+          }
+
+          # Optional CapCut
+          if ($installCapCut -eq "yes") {
+            Install-WingetPackage -Id "ByteDance.CapCut" -Name "CapCut" -Optional
+          } else {
+            Write-Host "Skipping CapCut because install_capcut=$installCapCut"
+          }
+
+          # Resolve npm after Node.js installation
+          $npm = $null
+          $npmCandidates = @(
+            "$env:ProgramFiles\nodejs\npm.cmd",
+            "${env:ProgramFiles(x86)}\nodejs\npm.cmd"
+          )
+
+          $npm = $npmCandidates |
+            Where-Object { $_ -and (Test-Path $_) } |
+            Select-Object -First 1
+
+          if (-not $npm) {
+            $npm = (Get-Command npm.cmd -ErrorAction SilentlyContinue).Source
+          }
+
+          if (-not $npm) {
+            Write-Error "❌ npm.cmd tidak ditemukan setelah instalasi Node.js"
+            exit 1
+          }
+
+          # Codex CLI via official npm package
+          Write-Host "Installing Codex CLI using npm: $npm"
+          & $npm install -g @openai/codex
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ Codex CLI installation failed"
+            exit 1
+          }
+
+          Write-Host "✅ Codex CLI installed"
+
+          # 9Router CLI via npm package
+          Write-Host "Installing 9Router CLI using npm: $npm"
+          & $npm install -g 9router
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ 9Router CLI installation failed"
+            exit 1
+          }
+
+          Write-Host "✅ 9Router CLI installed"
+
+          # IDE extensions: Codex + Office Viewer
+          $editorExtensions = @(
+            @{ Id = "OpenAI.chatgpt"; Name = "Codex / ChatGPT by OpenAI" },
+            @{ Id = "cweijan.vscode-office"; Name = "Office Viewer" }
+          )
+
+          if ($wantedVSCode) {
+            $codeCli = Resolve-VSCodeCli
+
+            if ($codeCli) {
+              foreach ($extension in $editorExtensions) {
+                Install-EditorExtension -ToolPath $codeCli -ExtensionId $extension.Id -ExtensionName $extension.Name | Out-Null
+              }
+            } else {
+              Write-Warning "VS Code CLI code.cmd was not found. VS Code extensions will be installed by the RDP logon task if possible."
+            }
+          }
+
+          if ($wantedAntigravity) {
+            $antigravityExe = Resolve-AntigravityExecutable
+
+            if ($antigravityExe) {
+              foreach ($extension in $editorExtensions) {
+                Install-EditorExtension -ToolPath $antigravityExe -ExtensionId $extension.Id -ExtensionName $extension.Name | Out-Null
+              }
+            } else {
+              Write-Warning "Antigravity executable was not found yet. Extensions will be installed by launcher/logon task if the editor supports VS Code extension CLI flags."
+            }
+          }
+
+          # Prepare user-context extension install tasks for the RDP user.
+          # VS Code and VS Code-compatible IDE extensions are user-scoped, so this makes them ready after RDP login.
+          $setupDir = Join-Path $env:ProgramData "RDP-Setup"
+          New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
+
+          if ($wantedVSCode) {
+            $vscodeRdpScript = Join-Path $setupDir "install-vscode-extensions-for-rdp.ps1"
+
+            @'
+          $ErrorActionPreference = "Continue"
+
+          $extensions = @(
+            "OpenAI.chatgpt",
+            "cweijan.vscode-office"
+          )
+
+          function Resolve-VSCodeCli {
+            $candidates = @(
+              "$env:ProgramFiles\Microsoft VS Code\bin\code.cmd",
+              "${env:ProgramFiles(x86)}\Microsoft VS Code\bin\code.cmd",
+              "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd"
+            )
+
+            foreach ($candidate in $candidates) {
+              if ($candidate -and (Test-Path $candidate)) {
+                return (Resolve-Path $candidate).Path
+              }
+            }
+
+            $cmd = (Get-Command code.cmd -ErrorAction SilentlyContinue).Source
+            if ($cmd) { return $cmd }
+
+            return $null
+          }
+
+          $codeCli = $null
+
+          for ($i = 0; $i -lt 12 -and -not $codeCli; $i++) {
+            $codeCli = Resolve-VSCodeCli
+            if (-not $codeCli) {
+              Start-Sleep -Seconds 10
+            }
+          }
+
+          if ($codeCli) {
+            foreach ($extension in $extensions) {
+              & $codeCli --install-extension $extension --force
+            }
+
+            $settingsDir = Join-Path $env:APPDATA "Code\User"
+            New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+
+            $settingsPath = Join-Path $settingsDir "settings.json"
+            $settings = [ordered]@{
+              "workbench.startupEditor" = "none"
+              "extensions.ignoreRecommendations" = $true
+              "telemetry.telemetryLevel" = "off"
+            }
+
+            $settings | ConvertTo-Json -Depth 5 | Set-Content -Path $settingsPath -Encoding UTF8
+          } else {
+            Write-Host "VS Code CLI was not found for user $env:USERNAME."
+          }
+
+          Unregister-ScheduledTask -TaskName "Install VS Code Extensions for RDP" -Confirm:$false -ErrorAction SilentlyContinue
+          '@ | Set-Content -Path $vscodeRdpScript -Encoding UTF8
+
+            Register-RdpLogonTask -TaskName "Install VS Code Extensions for RDP" -ScriptPath $vscodeRdpScript
+          }
+
+          if ($wantedAntigravity) {
+            $antigravityRdpScript = Join-Path $setupDir "install-antigravity-extensions-for-rdp.ps1"
+
+            @'
+          $ErrorActionPreference = "Continue"
+
+          $extensions = @(
+            "OpenAI.chatgpt",
+            "cweijan.vscode-office"
+          )
+
+          function Resolve-AntigravityExecutable {
+            $candidateExePaths = @(
+              "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
+              "$env:LOCALAPPDATA\Antigravity IDE\Antigravity IDE.exe",
+              "C:\Users\runneradmin\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe",
+              "$env:ProgramFiles\Antigravity IDE\Antigravity IDE.exe",
+              "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe"
+            )
+
+            foreach ($candidate in $candidateExePaths) {
+              if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+              if (Test-Path $candidate) {
+                return (Resolve-Path $candidate).Path
+              }
+            }
+
+            $searchRoots = @(
+              "$env:LOCALAPPDATA\Programs",
+              "$env:LOCALAPPDATA",
+              "C:\Users\runneradmin\AppData\Local\Programs",
+              "$env:ProgramFiles",
+              "${env:ProgramFiles(x86)}"
+            )
+
+            foreach ($root in $searchRoots) {
+              if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root)) { continue }
+
+              $found = Get-ChildItem `
+                -Path $root `
+                -Include "Antigravity IDE.exe", "antigravity-ide.exe" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+
+              if ($found) {
+                return $found.FullName
+              }
+            }
+
+            return $null
+          }
+
+          $antigravityExe = $null
+
+          for ($i = 0; $i -lt 12 -and -not $antigravityExe; $i++) {
+            $antigravityExe = Resolve-AntigravityExecutable
+            if (-not $antigravityExe) {
+              Start-Sleep -Seconds 10
+            }
+          }
+
+          if ($antigravityExe) {
+            foreach ($extension in $extensions) {
+              & $antigravityExe --install-extension $extension --force
+            }
+
+            $settingsRoots = @(
+              (Join-Path $env:APPDATA "Antigravity\User"),
+              (Join-Path $env:APPDATA "Antigravity IDE\User")
+            )
+
+            foreach ($settingsDir in $settingsRoots) {
+              New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+              $settingsPath = Join-Path $settingsDir "settings.json"
+              $settings = [ordered]@{
+                "workbench.startupEditor" = "none"
+                "extensions.ignoreRecommendations" = $true
+              }
+
+              $settings | ConvertTo-Json -Depth 5 | Set-Content -Path $settingsPath -Encoding UTF8
+            }
+          } else {
+            Write-Host "Antigravity executable was not found for user $env:USERNAME."
+          }
+
+          Unregister-ScheduledTask -TaskName "Install Antigravity Extensions for RDP" -Confirm:$false -ErrorAction SilentlyContinue
+          '@ | Set-Content -Path $antigravityRdpScript -Encoding UTF8
+
+            Register-RdpLogonTask -TaskName "Install Antigravity Extensions for RDP" -ScriptPath $antigravityRdpScript
+          }
+
+          # Force install Chrome extensions for all users via Chrome enterprise policy
+          $extensionUpdateUrl = "https://clients2.google.com/service/update2/crx"
+          $chromePolicyPath = "HKLM:\Software\Policies\Google\Chrome\ExtensionInstallForcelist"
+
+          New-Item -Path $chromePolicyPath -Force | Out-Null
+
+          $chromeExtensions = @(
+            "hlkenndednhfkekhgcdicdfddnkalmdm;$extensionUpdateUrl", # Cookie-Editor
+            "fdpohaocaechififmbbbbbknoalclacl;$extensionUpdateUrl"  # GoFullPage
+          )
+
+          for ($i = 0; $i -lt $chromeExtensions.Count; $i++) {
+            New-ItemProperty `
+              -Path $chromePolicyPath `
+              -Name "$($i + 1)" `
+              -Value $chromeExtensions[$i] `
+              -PropertyType String `
+              -Force | Out-Null
+          }
+
+          Write-Host "✅ Chrome extensions policy configured"
+          Write-Host "   - Cookie-Editor"
+          Write-Host "   - GoFullPage"
+          Write-Host "✅ App and IDE setup completed"
+
+      - name: 🧬 Prepare Antigravity IDE for RDP User
+        if: ${{ inputs.ide_choice == 'antigravity' || inputs.ide_choice == 'both' }}
+        shell: pwsh
+        run: |
+          Write-Host "==========================================="
+          Write-Host " Preparing Antigravity IDE for RDP user"
+          Write-Host "==========================================="
+          Write-Host "Antigravity IDE is installed with user scope under runneradmin. This step stages it in ProgramData and prepares a per-user copy for $env:RDP_USER."
+
+          $setupDir = Join-Path $env:ProgramData "RDP-Setup"
+          $antigravityStagingRoot = Join-Path $setupDir "Antigravity IDE"
+          $antigravityLauncherScript = Join-Path $setupDir "launch-antigravity-ide.ps1"
+          $antigravityCopyScript = Join-Path $setupDir "copy-antigravity-ide-for-rdp.ps1"
+
+          New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
+
+          function Resolve-AntigravityIdeExe {
+            $candidateExePaths = @(
+              "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
+              "$env:LOCALAPPDATA\Antigravity IDE\Antigravity IDE.exe",
+              "C:\Users\runneradmin\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe",
+              "$env:ProgramFiles\Antigravity IDE\Antigravity IDE.exe",
+              "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe"
+            )
+
+            foreach ($candidate in $candidateExePaths) {
+              if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+              if (Test-Path $candidate) {
+                return (Resolve-Path $candidate).Path
+              }
+            }
+
+            $searchRoots = @(
+              "$env:LOCALAPPDATA\Programs",
+              "$env:LOCALAPPDATA",
+              "C:\Users\runneradmin\AppData\Local\Programs",
+              "$env:ProgramFiles",
+              "${env:ProgramFiles(x86)}"
+            )
+
+            foreach ($root in $searchRoots) {
+              if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root)) { continue }
+
+              $found = Get-ChildItem `
+                -Path $root `
+                -Include "Antigravity IDE.exe", "antigravity-ide.exe" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+
+              if ($found) {
+                return $found.FullName
+              }
+            }
+
+            return $null
+          }
+
+          $antigravitySourceExe = Resolve-AntigravityIdeExe
+
+          if (-not $antigravitySourceExe) {
+            Write-Warning "Antigravity IDE executable was not found. RDP user copy and launcher will still be prepared, but shortcut may not work until the package path is corrected."
+          } else {
+            $antigravitySourceDir = Split-Path $antigravitySourceExe -Parent
+            Write-Host "Found Antigravity IDE source: $antigravitySourceDir"
+
+            if (Test-Path $antigravityStagingRoot) {
+              Remove-Item -Path $antigravityStagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            New-Item -ItemType Directory -Path $antigravityStagingRoot -Force | Out-Null
+            Copy-Item -Path (Join-Path $antigravitySourceDir "*") -Destination $antigravityStagingRoot -Recurse -Force
+            Write-Host "✅ Antigravity IDE staged to: $antigravityStagingRoot"
+          }
+
+          @'
+          $ErrorActionPreference = "Continue"
+
+          $sourceRoot = Join-Path $env:ProgramData "RDP-Setup\Antigravity IDE"
+          $destRoot = Join-Path $env:LOCALAPPDATA "Programs\Antigravity IDE"
+          $sourceExe = Join-Path $sourceRoot "Antigravity IDE.exe"
+          $destExe = Join-Path $destRoot "Antigravity IDE.exe"
+
+          if (-not (Test-Path $sourceExe)) {
+            Write-Host "Antigravity IDE staged source not found: $sourceExe"
+            exit 1
+          }
+
+          $shouldCopy = -not (Test-Path $destExe)
+
+          if (-not $shouldCopy) {
+            try {
+              $sourceTime = (Get-Item $sourceExe).LastWriteTimeUtc
+              $destTime = (Get-Item $destExe).LastWriteTimeUtc
+              if ($sourceTime -gt $destTime) {
+                $shouldCopy = $true
+              }
+            } catch {
+              $shouldCopy = $true
+            }
+          }
+
+          if ($shouldCopy) {
+            New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
+            Copy-Item -Path (Join-Path $sourceRoot "*") -Destination $destRoot -Recurse -Force
+          }
+
+          if (Test-Path $destExe) {
+            $extensions = @(
+              "OpenAI.chatgpt",
+              "cweijan.vscode-office"
+            )
+
+            foreach ($extension in $extensions) {
+              & $destExe --install-extension $extension --force
+            }
+
+            Start-Process -FilePath $destExe
+          } else {
+            Write-Host "Antigravity IDE executable not found after copy: $destExe"
+            exit 1
+          }
+          '@ | Set-Content -Path $antigravityLauncherScript -Encoding UTF8
+
+          @'
+          $ErrorActionPreference = "Continue"
+
+          $sourceRoot = Join-Path $env:ProgramData "RDP-Setup\Antigravity IDE"
+          $destRoot = Join-Path $env:LOCALAPPDATA "Programs\Antigravity IDE"
+          $sourceExe = Join-Path $sourceRoot "Antigravity IDE.exe"
+          $destExe = Join-Path $destRoot "Antigravity IDE.exe"
+
+          if (Test-Path $sourceExe) {
+            if (-not (Test-Path $destExe)) {
+              New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
+              Copy-Item -Path (Join-Path $sourceRoot "*") -Destination $destRoot -Recurse -Force
+            }
+          }
+
+          if (Test-Path $destExe) {
+            $extensions = @(
+              "OpenAI.chatgpt",
+              "cweijan.vscode-office"
+            )
+
+            foreach ($extension in $extensions) {
+              & $destExe --install-extension $extension --force
+            }
+          }
+
+          Unregister-ScheduledTask -TaskName "Prepare Antigravity IDE for RDP" -Confirm:$false -ErrorAction SilentlyContinue
+          '@ | Set-Content -Path $antigravityCopyScript -Encoding UTF8
+
+          # If the RDP profile already exists, copy immediately. Otherwise the logon task and launcher will do it after RDP signs in.
+          $rdpProfile = Join-Path "C:\Users" $env:RDP_USER
+          $rdpAntigravityDest = Join-Path $rdpProfile "AppData\Local\Programs\Antigravity IDE"
+
+          if ((Test-Path $rdpProfile) -and (Test-Path $antigravityStagingRoot)) {
+            New-Item -ItemType Directory -Path $rdpAntigravityDest -Force | Out-Null
+            Copy-Item -Path (Join-Path $antigravityStagingRoot "*") -Destination $rdpAntigravityDest -Recurse -Force
+            Write-Host "✅ Antigravity IDE copied immediately to RDP profile: $rdpAntigravityDest"
+          } else {
+            Write-Host "RDP profile is not ready yet. Antigravity IDE will be copied when $env:RDP_USER logs in or opens the shortcut."
+          }
+
+          try {
+            $action = New-ScheduledTaskAction `
+              -Execute "powershell.exe" `
+              -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$antigravityCopyScript`""
+
+            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:RDP_USER
+
+            Register-ScheduledTask `
+              -TaskName "Prepare Antigravity IDE for RDP" `
+              -Action $action `
+              -Trigger $trigger `
+              -User $env:RDP_USER `
+              -Password $env:RDP_PASSWORD `
+              -RunLevel Highest `
+              -Force | Out-Null
+
+            Write-Host "✅ One-time Antigravity IDE copy task registered for $env:RDP_USER"
+          } catch {
+            Write-Warning "Could not register Antigravity IDE copy task: $($_.Exception.Message)"
+          }
+
+          Write-Host "✅ Antigravity IDE RDP preparation completed"
+
+      - name: 🧷 Publish App Shortcuts for RDP User
+        shell: pwsh
+        run: |
+          Write-Host "==========================================="
+          Write-Host " Publishing installed apps to RDP user UI"
+          Write-Host "==========================================="
+          Write-Host "Apps may be installed under runneradmin/user scope. Shortcuts below are published through Public Desktop and the common Start Menu so they appear when logging in as $env:RDP_USER."
+
+          $ideChoice = '${{ inputs.ide_choice }}'
+          $installCapCut = '${{ inputs.install_capcut }}'
+          $wantedVSCode = $ideChoice -in @("vscode", "both")
+          $wantedAntigravity = $ideChoice -in @("antigravity", "both")
+
+          $publicDesktop = Join-Path $env:PUBLIC "Desktop"
+          $commonStartMenu = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"
+          $shortcutDirectories = @($publicDesktop, $commonStartMenu)
+
+          $rdpProfile = Join-Path "C:\Users" $env:RDP_USER
+          if (Test-Path $rdpProfile) {
+            $shortcutDirectories += Join-Path $rdpProfile "Desktop"
+            $shortcutDirectories += Join-Path $rdpProfile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+          }
+
+          $shortcutDirectories = $shortcutDirectories |
+            Where-Object { $_ -and $_.Trim() } |
+            Select-Object -Unique
+
+          foreach ($dir in $shortcutDirectories) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          }
+
+          function Resolve-AppTarget {
+            param(
+              [string[]] $CandidatePaths = @(),
+              [string[]] $SearchRoots = @(),
+              [string[]] $ExecutableNames = @()
+            )
+
+            foreach ($candidate in $CandidatePaths) {
+              if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+              $expanded = [Environment]::ExpandEnvironmentVariables($candidate)
+              if (Test-Path $expanded) {
+                return (Resolve-Path $expanded).Path
+              }
+            }
+
+            foreach ($root in $SearchRoots) {
+              if ([string]::IsNullOrWhiteSpace($root)) { continue }
+
+              $expandedRoot = [Environment]::ExpandEnvironmentVariables($root)
+              if (-not (Test-Path $expandedRoot)) { continue }
+
+              foreach ($exeName in $ExecutableNames) {
+                $found = Get-ChildItem `
+                  -Path $expandedRoot `
+                  -Filter $exeName `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+
+                if ($found) {
+                  return $found.FullName
+                }
+              }
+            }
+
+            return $null
+          }
+
+          function New-AppShortcut {
+            param(
+              [Parameter(Mandatory = $true)] [string] $Name,
+              [AllowNull()] [string] $TargetPath,
+              [string] $Arguments = "",
+              [string] $IconLocation = "",
+              [string] $WorkingDirectory = ""
+            )
+
+            if ([string]::IsNullOrWhiteSpace($TargetPath) -or -not (Test-Path $TargetPath)) {
+              Write-Warning "Shortcut skipped for $Name because target was not found: $TargetPath"
+              return
+            }
+
+            $shell = New-Object -ComObject WScript.Shell
+
+            foreach ($dir in $shortcutDirectories) {
+              $shortcutPath = Join-Path $dir "$Name.lnk"
+              $shortcut = $shell.CreateShortcut($shortcutPath)
+              $shortcut.TargetPath = $TargetPath
+              $shortcut.Arguments = $Arguments
+
+              if ([string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+                $shortcut.WorkingDirectory = Split-Path $TargetPath -Parent
+              } else {
+                $shortcut.WorkingDirectory = $WorkingDirectory
+              }
+
+              $shortcut.IconLocation = if ([string]::IsNullOrWhiteSpace($IconLocation)) { $TargetPath } else { $IconLocation }
+              $shortcut.Save()
+
+              Write-Host "✅ Shortcut created: $shortcutPath"
+            }
+          }
+
+          $runnerLocalPrograms = Join-Path $env:LOCALAPPDATA "Programs"
+          $runnerRoamingNpm = Join-Path $env:APPDATA "npm"
+          $antigravityLauncher = Join-Path $env:ProgramData "RDP-Setup\launch-antigravity-ide.ps1"
+
+          $chromeTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+              "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+            ) `
+            -SearchRoots @(
+              "$env:ProgramFiles\Google",
+              "${env:ProgramFiles(x86)}\Google"
+            ) `
+            -ExecutableNames @("chrome.exe")
+
+          $winrarTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$env:ProgramFiles\WinRAR\WinRAR.exe",
+              "${env:ProgramFiles(x86)}\WinRAR\WinRAR.exe"
+            ) `
+            -SearchRoots @(
+              "$env:ProgramFiles\WinRAR",
+              "${env:ProgramFiles(x86)}\WinRAR"
+            ) `
+            -ExecutableNames @("WinRAR.exe")
+
+          $vscodeTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$env:ProgramFiles\Microsoft VS Code\Code.exe",
+              "${env:ProgramFiles(x86)}\Microsoft VS Code\Code.exe",
+              "$runnerLocalPrograms\Microsoft VS Code\Code.exe"
+            ) `
+            -SearchRoots @(
+              "$env:ProgramFiles\Microsoft VS Code",
+              "${env:ProgramFiles(x86)}\Microsoft VS Code",
+              "$runnerLocalPrograms\Microsoft VS Code"
+            ) `
+            -ExecutableNames @("Code.exe")
+
+          $antigravityIdeTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$runnerLocalPrograms\Antigravity IDE\Antigravity IDE.exe",
+              "$env:LOCALAPPDATA\Antigravity IDE\Antigravity IDE.exe",
+              "C:\Users\runneradmin\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe"
+            ) `
+            -SearchRoots @(
+              $runnerLocalPrograms,
+              "$env:LOCALAPPDATA",
+              "C:\Users\runneradmin\AppData\Local\Programs",
+              "$env:ProgramFiles\Antigravity IDE",
+              "${env:ProgramFiles(x86)}\Antigravity IDE"
+            ) `
+            -ExecutableNames @("Antigravity IDE.exe", "antigravity-ide.exe")
+
+          $nodeTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$env:ProgramFiles\nodejs\node.exe",
+              "${env:ProgramFiles(x86)}\nodejs\node.exe"
+            ) `
+            -SearchRoots @(
+              "$env:ProgramFiles\nodejs",
+              "${env:ProgramFiles(x86)}\nodejs"
+            ) `
+            -ExecutableNames @("node.exe")
+
+          $codexTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$runnerRoamingNpm\codex.cmd",
+              "$env:ProgramFiles\nodejs\codex.cmd",
+              "${env:ProgramFiles(x86)}\nodejs\codex.cmd"
+            ) `
+            -SearchRoots @(
+              $runnerRoamingNpm,
+              "$env:ProgramFiles\nodejs",
+              "${env:ProgramFiles(x86)}\nodejs"
+            ) `
+            -ExecutableNames @("codex.cmd", "codex.ps1")
+
+          $nineRouterTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$runnerRoamingNpm\9router.cmd",
+              "$env:ProgramFiles\nodejs\9router.cmd",
+              "${env:ProgramFiles(x86)}\nodejs\9router.cmd"
+            ) `
+            -SearchRoots @(
+              $runnerRoamingNpm,
+              "$env:ProgramFiles\nodejs",
+              "${env:ProgramFiles(x86)}\nodejs"
+            ) `
+            -ExecutableNames @("9router.cmd", "9router.ps1")
+
+          $capCutTarget = Resolve-AppTarget `
+            -CandidatePaths @(
+              "$env:ProgramFiles\CapCut\CapCut.exe",
+              "${env:ProgramFiles(x86)}\CapCut\CapCut.exe",
+              "$env:LOCALAPPDATA\CapCut\CapCut.exe",
+              "$env:LOCALAPPDATA\Programs\CapCut\CapCut.exe"
+            ) `
+            -SearchRoots @(
+              "$env:ProgramFiles\CapCut",
+              "${env:ProgramFiles(x86)}\CapCut",
+              "$env:LOCALAPPDATA\CapCut",
+              "$env:LOCALAPPDATA\Programs\CapCut"
+            ) `
+            -ExecutableNames @("CapCut.exe")
+
+          New-AppShortcut -Name "Google Chrome" -TargetPath $chromeTarget
+          New-AppShortcut -Name "WinRAR" -TargetPath $winrarTarget
+
+          if ($wantedVSCode) {
+            New-AppShortcut -Name "Visual Studio Code" -TargetPath $vscodeTarget
+          } else {
+            Write-Host "Skipping VS Code shortcut because ide_choice=$ideChoice"
+          }
+
+          if ($wantedAntigravity) {
+            if (Test-Path $antigravityLauncher) {
+              $antigravityIcon = if ($antigravityIdeTarget -and (Test-Path $antigravityIdeTarget)) { $antigravityIdeTarget } else { "$env:SystemRoot\System32\shell32.dll,2" }
+              New-AppShortcut -Name "Antigravity IDE" -TargetPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$antigravityLauncher`"" -IconLocation $antigravityIcon
+            } else {
+              New-AppShortcut -Name "Antigravity IDE" -TargetPath $antigravityIdeTarget
+            }
+          } else {
+            Write-Host "Skipping Antigravity shortcut because ide_choice=$ideChoice"
+          }
+
+          if ($nodeTarget) {
+            New-AppShortcut -Name "Node.js Command Prompt" -TargetPath "$env:SystemRoot\System32\cmd.exe" -Arguments "/k `"$nodeTarget`" --version"
+          }
+
+          if ($codexTarget) {
+            New-AppShortcut -Name "Codex CLI" -TargetPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments "-NoExit -ExecutionPolicy Bypass -Command `"& '$codexTarget'`"" -IconLocation "$env:SystemRoot\System32\shell32.dll,220" -WorkingDirectory $env:USERPROFILE
+          } else {
+            New-AppShortcut -Name "Codex CLI" -TargetPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments "-NoExit -ExecutionPolicy Bypass -Command `"codex`"" -IconLocation "$env:SystemRoot\System32\shell32.dll,220" -WorkingDirectory $env:USERPROFILE
+          }
+
+          if ($nineRouterTarget) {
+            New-AppShortcut -Name "9Router" -TargetPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments "-NoExit -ExecutionPolicy Bypass -Command `"& '$nineRouterTarget'`""
+          }
+
+          if ($installCapCut -eq "yes") {
+            New-AppShortcut -Name "CapCut" -TargetPath $capCutTarget
+          } else {
+            Write-Host "Skipping CapCut shortcut because install_capcut=$installCapCut"
+          }
+
+          Write-Host "✅ Shortcut publishing completed"
+
+      - name: 🐾 Install Tailscale
+        shell: pwsh
+        run: |
+          Write-Host "Detecting Windows runner architecture..."
+
+          $tailscaleVersion = "1.98.2"
+          $runnerArch = $env:RUNNER_ARCH
+
+          if ([string]::IsNullOrWhiteSpace($runnerArch)) {
+            $runnerArch = $env:PROCESSOR_ARCHITECTURE
+          }
+
+          Write-Host "Runner architecture: $runnerArch"
+
+          switch -Regex ($runnerArch) {
+            "ARM64" {
+              $tsArch = "arm64"
+            }
+            "X64|AMD64" {
+              $tsArch = "amd64"
+            }
+            "X86" {
+              $tsArch = "x86"
+            }
+            default {
+              Write-Error "Unsupported architecture: $runnerArch"
+              exit 1
+            }
+          }
+
+          $tsUrl  = "https://pkgs.tailscale.com/stable/tailscale-setup-$tailscaleVersion-$tsArch.msi"
+          $tsPath = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale:"
+          Write-Host $tsUrl
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $tsPath `
+            -UseBasicParsing
+
+          if (-not (Test-Path $tsPath)) {
+            Write-Error "Tailscale installer download failed"
+            exit 1
+          }
+
+          Write-Host "Installing Tailscale silently..."
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$tsPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $tsPath -Force -ErrorAction SilentlyContinue
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "❌ Tailscale installation failed"
+            exit 1
+          }
+
+          Write-Host "✅ Tailscale installed successfully"
+
+      - name: 🌐 Connect Tailscale
+        shell: pwsh
+        run: |
+          Write-Host "Checking Tailscale auth key..."
+
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.TAILSCALE_AUTH_KEY }}")) {
+            Write-Error "❌ Secret TAILSCALE_AUTH_KEY belum diset di GitHub Repository Secrets"
+            exit 1
+          }
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "❌ tailscale.exe not found"
+            exit 1
+          }
+
+          $hostnameBase = '${{ inputs.tailscale_hostname }}'
+          $hostnameMode = '${{ inputs.hostname_mode }}'
+
+          if ([string]::IsNullOrWhiteSpace($hostnameBase)) {
+            $hostnameBase = "rdp-runner"
+          }
+
+          # Tailscale/MagicDNS hostname-safe format: lowercase, letters, numbers, and hyphens.
+          $hostnameBase = $hostnameBase.ToLowerInvariant() -replace '[^a-z0-9-]', '-'
+          $hostnameBase = $hostnameBase.Trim('-')
+
+          if ([string]::IsNullOrWhiteSpace($hostnameBase)) {
+            $hostnameBase = "rdp-runner"
+          }
+
+          if ($hostnameMode -eq "same_each_run") {
+            $tsHostname = $hostnameBase
+          } else {
+            $suffix = "-${{ github.run_id }}"
+            $maxBaseLength = 63 - $suffix.Length
+
+            if ($hostnameBase.Length -gt $maxBaseLength) {
+              $hostnameBase = $hostnameBase.Substring(0, $maxBaseLength).Trim('-')
+            }
+
+            $tsHostname = "$hostnameBase$suffix"
+          }
+
+          if ($tsHostname.Length -gt 63) {
+            $tsHostname = $tsHostname.Substring(0, 63).Trim('-')
+          }
+
+          Write-Host "Connecting to Tailscale..."
+          Write-Host "Hostname mode      : $hostnameMode"
+          Write-Host "Tailscale hostname : $tsHostname"
+
+          & $tsExe up `
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --hostname="$tsHostname" `
+            --unattended `
+            --accept-routes
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ Tailscale connection failed"
+            exit 1
+          }
+
+          $tsIP = $null
+          $retry = 0
+
+          while (-not $tsIP -and $retry -lt 20) {
+            Start-Sleep -Seconds 5
+            $tsIP = (& $tsExe ip -4 2>$null).Trim()
+            $retry++
+            Write-Host "Waiting for Tailscale IP... attempt $retry"
+          }
+
+          if (-not $tsIP) {
+            Write-Error "❌ Tailscale IP not assigned"
+            exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "TAILSCALE_HOSTNAME=$tsHostname" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "TAILSCALE_HOSTNAME_MODE=$hostnameMode" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          Write-Host "✅ Tailscale connected"
+          Write-Host "Tailscale Hostname: $tsHostname"
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: ✅ Verify RDP Port
+        shell: pwsh
+        run: |
+          Write-Host "Verifying RDP port..."
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+            Write-Error "❌ RDP port 3389 unreachable"
+            exit 1
+          }
+
+          Write-Host "✅ RDP port verified"
+
+      - name: 📊 Generate Dashboard Summary
+        shell: pwsh
+        run: |
+          $ideChoice = '${{ inputs.ide_choice }}'
+          $installCapCut = '${{ inputs.install_capcut }}'
+          $hostnameMode = '${{ inputs.hostname_mode }}'
+          $passwordMode = '${{ inputs.rdp_password_mode }}'
+          $durationHours = '${{ inputs.duration_hours }}'
+          $windowsVersion = '${{ inputs.windows_version }}'
+
+          function Test-AnyPath {
+            param([string[]] $Paths)
+
+            foreach ($path in $Paths) {
+              if ([string]::IsNullOrWhiteSpace($path)) { continue }
+
+              $expanded = [Environment]::ExpandEnvironmentVariables($path)
+              if (Test-Path $expanded) {
+                return $true
+              }
+            }
+
+            return $false
+          }
+
+          function Test-CommandExists {
+            param([string] $Name)
+
+            $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+            return [bool]$cmd
+          }
+
+          function Get-InstallStatus {
+            param(
+              [bool] $Requested,
+              [bool] $Detected
+            )
+
+            if (-not $Requested) {
+              return "⏭️ Skipped"
+            }
+
+            if ($Detected) {
+              return "✅ Ready"
+            }
+
+            return "⚠️ Check logs"
+          }
+
+          function Add-Row {
+            param(
+              [System.Collections.Generic.List[string]] $Rows,
+              [string] $Col1,
+              [string] $Col2,
+              [string] $Col3 = ""
+            )
+
+            $Rows.Add("| $Col1 | $Col2 | $Col3 |") | Out-Null
+          }
+
+          if ($passwordMode -eq "same_from_secret") {
+            $passwordDisplay = "Use GitHub Secret ``RDP_PASSWORD``"
+          } else {
+            $passwordDisplay = "``$env:RDP_PASSWORD``"
+          }
+
+          $wantedVSCode = $ideChoice -in @("vscode", "both")
+          $wantedAntigravity = $ideChoice -in @("antigravity", "both")
+          $wantedCapCut = $installCapCut -eq "yes"
+
+          $chromeDetected = Test-AnyPath @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          )
+
+          $winrarDetected = Test-AnyPath @(
+            "$env:ProgramFiles\WinRAR\WinRAR.exe",
+            "${env:ProgramFiles(x86)}\WinRAR\WinRAR.exe"
+          )
+
+          $nodeDetected = Test-AnyPath @(
+            "$env:ProgramFiles\nodejs\node.exe",
+            "${env:ProgramFiles(x86)}\nodejs\node.exe"
+          )
+
+          $vscodeDetected = Test-AnyPath @(
+            "$env:ProgramFiles\Microsoft VS Code\Code.exe",
+            "${env:ProgramFiles(x86)}\Microsoft VS Code\Code.exe",
+            "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+          )
+
+          $antigravityDetected = Test-AnyPath @(
+            "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
+            "$env:LOCALAPPDATA\Antigravity IDE\Antigravity IDE.exe",
+            "C:\Users\runneradmin\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe",
+            "$env:ProgramFiles\Antigravity IDE\Antigravity IDE.exe",
+            "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe",
+            "$env:ProgramData\RDP-Setup\Antigravity IDE\Antigravity IDE.exe"
+          )
+
+          $capCutDetected = Test-AnyPath @(
+            "$env:ProgramFiles\CapCut\CapCut.exe",
+            "${env:ProgramFiles(x86)}\CapCut\CapCut.exe",
+            "$env:LOCALAPPDATA\CapCut\CapCut.exe",
+            "$env:LOCALAPPDATA\Programs\CapCut\CapCut.exe"
+          )
+
+          $codexDetected = (Test-CommandExists "codex") -or (Test-AnyPath @(
+            "$env:APPDATA\npm\codex.cmd",
+            "$env:ProgramFiles\nodejs\codex.cmd",
+            "${env:ProgramFiles(x86)}\nodejs\codex.cmd"
+          ))
+
+          $nineRouterDetected = (Test-CommandExists "9router") -or (Test-AnyPath @(
+            "$env:APPDATA\npm\9router.cmd",
+            "$env:ProgramFiles\nodejs\9router.cmd",
+            "${env:ProgramFiles(x86)}\nodejs\9router.cmd"
+          ))
+
+          $appRows = [System.Collections.Generic.List[string]]::new()
+          $appRows.Add("| Application | Status | Notes |") | Out-Null
+          $appRows.Add("|---|---:|---|") | Out-Null
+
+          Add-Row $appRows "Google Chrome" (Get-InstallStatus $true $chromeDetected) "Browser utama"
+          Add-Row $appRows "WinRAR" (Get-InstallStatus $true $winrarDetected) "Archive manager"
+          Add-Row $appRows "Node.js LTS" (Get-InstallStatus $true $nodeDetected) "Runtime untuk npm"
+          Add-Row $appRows "Codex CLI" (Get-InstallStatus $true $codexDetected) "Install via npm ``@openai/codex``"
+          Add-Row $appRows "9Router CLI" (Get-InstallStatus $true $nineRouterDetected) "Install via npm ``9router``"
+          Add-Row $appRows "Visual Studio Code" (Get-InstallStatus $wantedVSCode $vscodeDetected) "Machine-wide install"
+          Add-Row $appRows "Antigravity IDE" (Get-InstallStatus $wantedAntigravity $antigravityDetected) "Prepared for RDP user"
+          Add-Row $appRows "CapCut" (Get-InstallStatus $wantedCapCut $capCutDetected) "Optional"
+
+          $extensionRows = [System.Collections.Generic.List[string]]::new()
+          $extensionRows.Add("| Target | Extension / Feature | Status |") | Out-Null
+          $extensionRows.Add("|---|---|---:|") | Out-Null
+
+          if ($wantedVSCode) {
+            Add-Row $extensionRows "VS Code" "OpenAI / Codex extension ``OpenAI.chatgpt``" "✅ Configured"
+            Add-Row $extensionRows "VS Code" "Office Viewer ``cweijan.vscode-office``" "✅ Configured"
+          } else {
+            Add-Row $extensionRows "VS Code" "OpenAI + Office Viewer extensions" "⏭️ Skipped"
+          }
+
+          if ($wantedAntigravity) {
+            Add-Row $extensionRows "Antigravity" "OpenAI + Office Viewer extensions" "✅ Best effort"
+          } else {
+            Add-Row $extensionRows "Antigravity" "OpenAI + Office Viewer extensions" "⏭️ Skipped"
+          }
+
+          Add-Row $extensionRows "Chrome" "Cookie-Editor + GoFullPage" "✅ Policy configured"
+
+          $summaryLines = [System.Collections.Generic.List[string]]::new()
+
+          $summaryLines.Add("# 🪟 Windows RDP Dashboard") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          $summaryLines.Add("> ✅ Runner siap digunakan. Gunakan hostname sebagai alamat utama, lalu pakai IP Tailscale sebagai fallback jika MagicDNS belum resolve.") | Out-Null
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 🎯 Recommended Login") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          $summaryLines.Add("| Use this | Value |") | Out-Null
+          $summaryLines.Add("|---|---|") | Out-Null
+          $summaryLines.Add("| Primary address | ``$env:TAILSCALE_HOSTNAME`` |") | Out-Null
+          $summaryLines.Add("| Fallback address | ``$env:TAILSCALE_IP`` |") | Out-Null
+          $summaryLines.Add("| Username | ``$env:RDP_USER`` |") | Out-Null
+          $summaryLines.Add("| Password | $passwordDisplay |") | Out-Null
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 🔗 Connection Details") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          $summaryLines.Add("| Item | Value |") | Out-Null
+          $summaryLines.Add("|---|---|") | Out-Null
+          $summaryLines.Add("| OS / Runner | ``$windowsVersion`` |") | Out-Null
+          $summaryLines.Add("| Tailscale Hostname | ``$env:TAILSCALE_HOSTNAME`` |") | Out-Null
+          $summaryLines.Add("| Tailscale IP | ``$env:TAILSCALE_IP`` |") | Out-Null
+          $summaryLines.Add("| Hostname Mode | ``$hostnameMode`` |") | Out-Null
+          $summaryLines.Add("| Password Mode | ``$passwordMode`` |") | Out-Null
+          $summaryLines.Add("| Runtime Duration | ``$durationHours hour(s)`` |") | Out-Null
+          $summaryLines.Add("| IDE Choice | ``$ideChoice`` |") | Out-Null
+          $summaryLines.Add("| CapCut Option | ``$installCapCut`` |") | Out-Null
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 📦 App Status") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          foreach ($line in $appRows) { $summaryLines.Add($line) | Out-Null }
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 🧩 Extensions & Policies") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          foreach ($line in $extensionRows) { $summaryLines.Add($line) | Out-Null }
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 🚀 How to Connect") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          $summaryLines.Add("1. Buka **Microsoft Remote Desktop** di perangkat kamu.") | Out-Null
+          $summaryLines.Add("2. Pastikan perangkat kamu sudah login ke **Tailscale tailnet yang sama**.") | Out-Null
+          $summaryLines.Add("3. Masukkan **Primary address**: ``$env:TAILSCALE_HOSTNAME``.") | Out-Null
+          $summaryLines.Add("4. Jika hostname belum connect, pakai **Fallback address**: ``$env:TAILSCALE_IP``.") | Out-Null
+          $summaryLines.Add("5. Login dengan username ``$env:RDP_USER`` dan password di bagian Recommended Login.") | Out-Null
+          $summaryLines.Add("6. Buka IDE dari Desktop atau Start Menu setelah masuk RDP.") | Out-Null
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 🧯 Troubleshooting") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          $summaryLines.Add("| Problem | Try this |") | Out-Null
+          $summaryLines.Add("|---|---|") | Out-Null
+          $summaryLines.Add("| Hostname tidak bisa connect | Pakai IP Tailscale fallback ``$env:TAILSCALE_IP`` |") | Out-Null
+          $summaryLines.Add("| Password ditolak | Cek ``rdp_password_mode``; jika ``same_from_secret``, gunakan secret ``RDP_PASSWORD`` |") | Out-Null
+          $summaryLines.Add("| VS Code tidak terbuka | Buka dari Start Menu, atau cek status ``Visual Studio Code`` di tabel App Status |") | Out-Null
+          $summaryLines.Add("| Antigravity belum muncul | Login ulang ke user RDP atau buka shortcut Antigravity; workflow menyiapkan copy per-user |") | Out-Null
+          $summaryLines.Add("| RDP timeout | Pastikan device lokal sudah connect ke Tailscale dan berada di tailnet yang sama |") | Out-Null
+          $summaryLines.Add("| MagicDNS belum resolve | Tunggu sebentar atau langsung pakai IP Tailscale |") | Out-Null
+          $summaryLines.Add("") | Out-Null
+
+          $summaryLines.Add("## 🧹 Cleanup") | Out-Null
+          $summaryLines.Add("") | Out-Null
+          $summaryLines.Add("Saat runtime selesai, gagal, atau workflow masuk cleanup, step terakhir akan mencoba menjalankan ``tailscale logout`` otomatis.") | Out-Null
+
+          $summaryLines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: ⏳ Show Access Info & Keep Alive
+        shell: pwsh
+        run: |
+          $passwordMode = '${{ inputs.rdp_password_mode }}'
+
+          if ($passwordMode -eq "same_from_secret") {
+            $passwordForDisplay = "Use GitHub Secret RDP_PASSWORD"
+          } else {
+            $passwordForDisplay = $env:RDP_PASSWORD
+          }
+
+          function Logout-TailscaleSafely {
+            $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+            if (Test-Path $tsExe) {
+              Write-Host "Logging out from Tailscale..."
+              & $tsExe logout
+
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "✅ Tailscale logout completed"
+              } else {
+                Write-Warning "Tailscale logout returned exit code $LASTEXITCODE"
+              }
+            } else {
+              Write-Host "tailscale.exe not found. Skipping logout."
+            }
+          }
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════╗"
+          Write-Host "║          WINDOWS RDP READY           ║"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║  Hostname : $env:TAILSCALE_HOSTNAME"
+          Write-Host "║  IP       : $env:TAILSCALE_IP"
+          Write-Host "║  Username : $env:RDP_USER"
+          Write-Host "║  Password : $passwordForDisplay"
+          Write-Host "╚══════════════════════════════════════╝"
+          Write-Host ""
+
+          try {
+            $hours = [int]'${{ inputs.duration_hours }}'
+            $seconds = $hours * 3600
+            $elapsed = 0
+
+            while ($elapsed -lt $seconds) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Session active - elapsed $elapsed seconds"
+              Start-Sleep -Seconds 300
+              $elapsed += 300
+            }
+
+            Write-Host "Session completed."
+          } finally {
+            Logout-TailscaleSafely
+          }
+
+      - name: 🧹 Cleanup Tailscale Logout
+        if: always()
+        shell: pwsh
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (Test-Path $tsExe) {
+            Write-Host "Running final Tailscale cleanup/logout..."
+            & $tsExe logout
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Final Tailscale logout completed"
+            } else {
+              Write-Warning "Final Tailscale logout returned exit code $LASTEXITCODE"
+            }
+          } else {
+            Write-Host "tailscale.exe not found. Skipping final cleanup."
+          }
